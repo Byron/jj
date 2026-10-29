@@ -15,7 +15,6 @@
 #![expect(missing_docs)]
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::fmt::Error;
 use std::fmt::Formatter;
@@ -24,12 +23,11 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Command;
-use std::process::ExitStatus;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -39,7 +37,6 @@ use futures::StreamExt as _;
 use futures::io::Cursor;
 use futures::stream::BoxStream;
 use gix::bstr::BString;
-use gix::objs::CommitRefIter;
 use gix::objs::Exists as _;
 use gix::objs::Write as _;
 use gix::objs::WriteTo as _;
@@ -167,14 +164,6 @@ pub enum GitRepoAtWorkdirError {
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-#[derive(Debug, Error)]
-pub enum GitGcError {
-    #[error("Failed to run git gc command")]
-    GcCommand(#[source] std::io::Error),
-    #[error("git gc command exited with an error: {0}")]
-    GcCommandErrorStatus(ExitStatus),
-}
-
 pub struct GitBackend {
     // While gix::Repository can be created from gix::ThreadSafeRepository, it's
     // cheaper to cache the thread-local instance behind a mutex than creating
@@ -188,7 +177,6 @@ pub struct GitBackend {
     shallow_root_ids: OnceLock<Vec<CommitId>>,
     extra_metadata_store: TableStore,
     cached_extra_metadata: Mutex<Option<Arc<ReadonlyTable>>>,
-    git_executable: PathBuf,
     write_change_id_header: bool,
 }
 
@@ -214,7 +202,6 @@ impl GitBackend {
             shallow_root_ids: OnceLock::new(),
             extra_metadata_store,
             cached_extra_metadata: Mutex::new(None),
-            git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
         }
     }
@@ -683,8 +670,8 @@ fn commit_from_git_without_root_parent(
     is_shallow: bool,
 ) -> BackendResult<Commit> {
     let decode_err = |err: gix::Error| to_read_object_err(err, id);
-    let commit = git_object
-        .try_to_commit_ref()
+    let (commit, signed_data) = git_object
+        .try_to_commit_ref_with_signed_data()
         .map_err(|err| to_read_object_err(err, id))?;
 
     // If the git header has a change-id field, we attempt to convert that to a
@@ -719,23 +706,11 @@ fn commit_from_git_without_root_parent(
     let author = signature_from_git(commit.author().map_err(decode_err)?);
     let committer = signature_from_git(commit.committer().map_err(decode_err)?);
 
-    // If the commit is signed, extract both the signature and the signed data
-    // (which is the commit buffer with the gpgsig header omitted).
-    // We have to re-parse the raw commit data because gix CommitRef does not give
-    // us the sogned data, only the signature.
-    // Ideally, we could use try_to_commit_ref_iter at the beginning of this
-    // function and extract everything from that. For now, this works
-    let secure_sig = commit
-        .extra_headers
-        .iter()
-        .any(|(k, _)| *k == signature_field_name(git_object.id.kind()))
-        .then(|| CommitRefIter::signature(&git_object.data, git_object.id.kind()))
-        .transpose()
-        .map_err(decode_err)?
-        .flatten()
-        .map(|(sig, data)| SecureSig {
+    let secure_sig = signed_data
+        .zip(commit.extra_headers().pgp_signature())
+        .map(|(data, sig)| SecureSig {
             data: data.to_bstring().into(),
-            sig: sig.into_owned().into(),
+            sig: sig.to_owned().into(),
         });
 
     Ok(Commit {
@@ -969,27 +944,6 @@ fn recreate_no_gc_refs(
         .edit_references(ref_edits)
         .map_err(|err| BackendError::Other(err.into()))?;
 
-    Ok(())
-}
-
-fn run_git_gc(program: &OsStr, git_dir: &Path, keep_newer: SystemTime) -> Result<(), GitGcError> {
-    let keep_newer = keep_newer
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default(); // underflow
-    let mut git = Command::new(program);
-    git.arg("--git-dir=.") // turn off discovery
-        .arg("gc")
-        .arg(format!("--prune=@{} +0000", keep_newer.as_secs()));
-    // Don't specify it by GIT_DIR/--git-dir. On Windows, the path could be
-    // canonicalized as UNC path, which wouldn't be supported by git.
-    git.current_dir(git_dir);
-    // TODO: pass output to UI layer instead of printing directly here
-    tracing::info!(?git, "running git gc");
-    let status = git.status().map_err(GitGcError::GcCommand)?;
-    tracing::info!(?status, "git gc exited");
-    if !status.success() {
-        return Err(GitGcError::GcCommandErrorStatus(status));
-    }
     Ok(())
 }
 
@@ -1578,15 +1532,16 @@ impl Backend for GitBackend {
             .gc(&table, keep_newer)
             .map_err(|err| BackendError::Other(err.into()))?;
 
-        run_git_gc(
-            self.git_executable.as_ref(),
-            self.git_repo_path(),
-            keep_newer,
-        )
-        .map_err(|err| BackendError::Other(err.into()))?;
-        // Since "git gc" will move loose refs into packed refs, in-memory
-        // packed-refs cache should be invalidated without relying on mtime.
-        git_repo.refs.force_refresh_packed_buffer().ok();
+        let outcome = git_repo
+            .gc(
+                gix::repository::gc::Options {
+                    expire: keep_newer,
+                    dry_run: false,
+                },
+                &AtomicBool::default(),
+            )
+            .map_err(|err| BackendError::Other(err.into()))?;
+        tracing::debug!(?outcome, "collected Git objects");
         Ok(())
     }
 }
@@ -1666,6 +1621,7 @@ recover.
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
+    use std::process::Command;
 
     use gix::date::parse::TimeBuf;
     use gix::objs::CommitRef;
@@ -1684,9 +1640,9 @@ mod tests {
 
     fn git_config() -> Vec<bstr::BString> {
         vec![
-            format!("user.name = {GIT_USER}").into(),
-            format!("user.email = {GIT_EMAIL}").into(),
-            "init.defaultBranch = master".into(),
+            format!("user.name={GIT_USER}").into(),
+            format!("user.email={GIT_EMAIL}").into(),
+            "init.defaultBranch=master".into(),
         ]
     }
 

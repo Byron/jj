@@ -56,7 +56,7 @@ pub mod git;
 #[cfg(feature = "git")]
 pub mod git_backend;
 #[cfg(feature = "git")]
-mod git_subprocess;
+mod git_remote;
 pub mod gitignore;
 pub mod gpg_signing;
 pub use jj_core::graph;

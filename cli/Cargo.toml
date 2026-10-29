@@ -80,6 +80,7 @@ erased-serde = { workspace = true }
 etcetera = { workspace = true }
 futures = { workspace = true }
 gix = { workspace = true, optional = true }
+gix-diff = { workspace = true }
 globset = { workspace = true }
 indexmap = { workspace = true }
 indoc = { workspace = true }
@@ -134,6 +135,9 @@ test-case = { workspace = true }
 testutils = { workspace = true }
 # https://github.com/rust-lang/cargo/issues/2911#issuecomment-1483256987
 jj-cli = { path = ".", features = ["test-fakes"], default-features = false }
+
+[build-dependencies]
+gix = { workspace = true }
 
 [features]
 default = ["watchman", "git"]

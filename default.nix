@@ -37,7 +37,13 @@ in
       "^target/"
     ];
 
-    cargoLock.lockFile = ./Cargo.lock;
+    cargoLock = {
+      lockFile = ./Cargo.lock;
+      # Fetch the pinned commit directly, even if the development branch is rebased.
+      outputHashes = {
+        "gix-0.90.0" = "sha256-RAfyz9ghU1PU/fzPS7jhVEO+2pwkxi1HxlgoqNWKR4M=";
+      };
+    };
     nativeBuildInputs =
       [
         installShellFiles
@@ -51,7 +57,7 @@ in
       gnupg
       openssh
 
-      # for git subprocess test
+      # for Git interoperability tests
       git
     ];
 

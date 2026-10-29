@@ -36,18 +36,18 @@ use std::fs::File;
 use std::iter;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use bstr::BStr;
 use bstr::BString;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::stream;
+use gix::error::ResultExt as _;
 use gix::refs::transaction::RefEdit;
 use gix::refspec::Instruction;
 use itertools::Itertools as _;
-use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::backend::BackendError;
@@ -56,16 +56,10 @@ use crate::backend::CommitId;
 use crate::backend::TreeValue;
 use crate::commit::Commit;
 use crate::config::ConfigGetError;
-use crate::file_util::IoResultExt as _;
-use crate::file_util::PathError;
-use crate::file_util::is_empty_dir;
 use crate::git_backend::GitBackend;
-use crate::git_subprocess::GitFetchStatus;
-pub use crate::git_subprocess::GitProgress;
-pub use crate::git_subprocess::GitSidebandLineTerminator;
-pub use crate::git_subprocess::GitSubprocessCallback;
-use crate::git_subprocess::GitSubprocessContext;
-use crate::git_subprocess::GitSubprocessError;
+pub use crate::git_remote::GitProgress;
+pub use crate::git_remote::GitRemoteCallback;
+pub use crate::git_remote::GitSidebandLineTerminator;
 use crate::index::IndexError;
 use crate::matchers::EverythingMatcher;
 use crate::merge::Diff;
@@ -124,7 +118,6 @@ const INDEX_DUMMY_CONFLICT_FILE: &str = ".jj-do-not-resolve-this-conflict";
 #[derive(Clone, Debug)]
 pub struct GitSettings {
     pub abandon_unreachable_commits: bool,
-    pub executable_path: PathBuf,
     pub record_synthetic_predecessors: bool,
     pub write_change_id_header: bool,
 }
@@ -133,39 +126,19 @@ impl GitSettings {
     pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
         Ok(Self {
             abandon_unreachable_commits: settings.get_bool("git.abandon-unreachable-commits")?,
-            executable_path: settings.get("git.executable-path")?,
             record_synthetic_predecessors: settings
                 .get_bool("git.record-synthetic-predecessors")?,
             write_change_id_header: settings.get("git.write-change-id-header")?,
         })
     }
-
-    pub fn to_subprocess_options(&self) -> GitSubprocessOptions {
-        GitSubprocessOptions {
-            executable_path: self.executable_path.clone(),
-            environment: HashMap::new(),
-        }
-    }
 }
 
-/// Configuration for a Git subprocess
-#[derive(Clone, Debug)]
-pub struct GitSubprocessOptions {
-    pub executable_path: PathBuf,
-    /// Used by consumers of jj-lib to set environment variables like
-    /// GIT_ASKPASS (for authentication callbacks) or GIT_TRACE (for debugging).
-    /// Setting per-subcommand environment variables avoids the need for unsafe
-    /// code and process-wide state.
+/// Configuration for native Git remote operations.
+#[derive(Clone, Debug, Default)]
+pub struct GitRemoteOptions {
+    /// Environment for authentication helpers, SSH, and other configured commands.
+    /// These overrides apply to this operation without changing process state.
     pub environment: HashMap<OsString, OsString>,
-}
-
-impl GitSubprocessOptions {
-    pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
-        Ok(Self {
-            executable_path: settings.get("git.executable-path")?,
-            environment: HashMap::new(),
-        })
-    }
 }
 
 #[derive(Debug, Error)]
@@ -261,15 +234,6 @@ impl RefSpec {
         }
     }
 
-    fn delete(destination: impl Into<String>) -> Self {
-        // We don't force push on branch deletion
-        Self {
-            forced: false,
-            source: None,
-            destination: destination.into(),
-        }
-    }
-
     pub(crate) fn to_git_format(&self) -> String {
         format!(
             "{}{}",
@@ -308,43 +272,6 @@ impl NegativeRefSpec {
 
     pub(crate) fn to_git_format(&self) -> String {
         format!("^{}", self.source)
-    }
-}
-
-/// Helper struct that matches a refspec with its expected location in the
-/// remote it's being pushed to
-pub(crate) struct RefToPush<'a> {
-    pub(crate) refspec: &'a RefSpec,
-    pub(crate) expected_location: Option<&'a gix::oid>,
-}
-
-impl<'a> RefToPush<'a> {
-    fn new(
-        refspec: &'a RefSpec,
-        expected_locations: &'a HashMap<&GitRefName, Option<&gix::oid>>,
-    ) -> Self {
-        let expected_location = *expected_locations
-            .get(GitRefName::new(&refspec.destination))
-            .expect(
-                "The refspecs and the expected locations were both constructed from the same \
-                 source of truth. This means the lookup should always work.",
-            );
-
-        Self {
-            refspec,
-            expected_location,
-        }
-    }
-
-    pub(crate) fn to_git_lease(&self) -> String {
-        format!(
-            "{}:{}",
-            self.refspec.destination,
-            self.expected_location
-                .map(|x| x.to_string())
-                .as_deref()
-                .unwrap_or("")
-        )
     }
 }
 
@@ -1893,26 +1820,12 @@ fn update_git_head(
 
 #[derive(Debug, Error)]
 pub enum GitCreateWorktreeError {
-    #[error(transparent)]
-    Subprocess(#[from] GitSubprocessError),
-    #[error("Failed to inspect the Git worktree destination")]
-    Destination(#[source] PathError),
-    #[error("Failed to create temporary directory for Git worktree")]
-    TempDir(#[source] std::io::Error),
     #[error("A .git file or directory already exists in the Git worktree destination")]
     ExistingGitLink,
-    #[error("Failed to move .git gitlink file into place")]
-    MoveGitLink(#[source] PathError),
-    #[error(transparent)]
-    Git(Box<dyn std::error::Error + Send + Sync>),
+    #[error("Failed to create Git worktree")]
+    Git(#[from] gix::Error),
     #[error(transparent)]
     UnexpectedBackend(#[from] UnexpectedGitBackendError),
-}
-
-impl GitCreateWorktreeError {
-    fn from_git(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self::Git(source.into())
-    }
 }
 
 /// Creates a Git worktree at `destination` to back a jj workspace.
@@ -1923,124 +1836,66 @@ impl GitCreateWorktreeError {
 /// enabled after the fact.
 ///
 /// For a new workspace, the subsequent HEAD export (see [`reset_head()`])
-/// points HEAD at the parent of the new working-copy commit. Git is only
-/// responsible for the `.git` gitlink and the worktree bookkeeping under
-/// `.git/worktrees/`.
-pub fn create_worktree(
-    store: &Store,
-    subprocess_options: GitSubprocessOptions,
-    destination: &Path,
-) -> Result<(), GitCreateWorktreeError> {
-    let git_backend = get_git_backend(store)?;
-
-    // The unborn branch `git worktree add --orphan` insists on naming gets a
-    // random name: any name we could derive from the destination may already
-    // be taken by an exported bookmark.
-    let branch_name = format!("jj-worktree-{:016x}", rand::random::<u64>());
-    let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
-
-    let destination_is_populated = destination.exists()
-        && !is_empty_dir(destination).map_err(GitCreateWorktreeError::Destination)?;
-    if destination_is_populated {
-        add_worktree_to_populated_dir(&git_ctx, destination, &branch_name)?;
-    } else {
-        git_ctx.spawn_worktree_add(destination, &branch_name)?;
-    }
-
-    // Must run after the gitlink at `destination` resolves, i.e. after any
-    // `git worktree repair` above.
-    //
-    // Nullifying HEAD puts the worktree in the same "HEAD has no commit yet"
-    // state jj uses everywhere else, so that a `git commit` in the new
-    // worktree can't materialize the branch nobody asked for. If the
-    // working-copy commit turns out to have a real parent, the HEAD export
-    // replaces this with a detached HEAD.
-    let git_repo = git_backend
-        .open_git_repo_at_workdir(destination)
-        .map_err(GitCreateWorktreeError::from_git)?;
-    let unborn_branch = gix::refs::Target::Symbolic(
-        format!("refs/heads/{branch_name}")
-            .try_into()
-            .expect("valid ref name"),
-    );
-    update_git_head(
-        &git_repo,
-        gix::refs::transaction::PreviousValue::MustExistAndMatch(unborn_branch),
-        None,
-    )
-    .map_err(GitCreateWorktreeError::from_git)
-}
-
-/// Adds a worktree for a directory that already has contents.
-///
-/// `git worktree add` refuses to use a non-empty directory, so the worktree is
-/// created in a temporary directory inside `destination`, its gitlink moved
-/// into place, and the recorded paths repaired.
-fn add_worktree_to_populated_dir(
-    git_ctx: &GitSubprocessContext,
-    destination: &Path,
-    branch_name: &str,
-) -> Result<(), GitCreateWorktreeError> {
-    let dot_git = destination.join(".git");
-    if dot_git.exists() {
+/// points HEAD at the parent of the new working-copy commit. Only the `.git`
+/// gitlink and worktree bookkeeping under `.git/worktrees/` are created here.
+pub fn create_worktree(store: &Store, destination: &Path) -> Result<(), GitCreateWorktreeError> {
+    if std::fs::symlink_metadata(destination.join(".git")).is_ok() {
         return Err(GitCreateWorktreeError::ExistingGitLink);
     }
-    let tmp_dir = TempDir::new_in(destination).map_err(GitCreateWorktreeError::TempDir)?;
-    let tmp_path = tmp_dir.path();
-    git_ctx.spawn_worktree_add(tmp_path, branch_name)?;
-
-    std::fs::rename(tmp_path.join(".git"), &dot_git)
-        .context(&dot_git)
-        .map_err(GitCreateWorktreeError::MoveGitLink)?;
-    if let Err(err) = git_ctx.spawn_worktree_repair(destination) {
-        std::fs::remove_file(&dot_git).ok();
-        return Err(err.into());
-    }
+    let mut git_repo = get_git_repo(store)?;
+    // Keep the repository and its workspaces portable when moved together.
+    git_repo
+        .config_snapshot_mut()
+        .set_raw_value("worktree.useRelativePaths", "true")?;
+    git_repo.register_worktree(
+        destination,
+        gix::worktree::add::Head::Unborn(UNBORN_ROOT_REF_NAME.try_into().expect("valid ref name")),
+        &AtomicBool::default(),
+    )?;
     Ok(())
 }
 
 #[derive(Debug, Error)]
 pub enum GitUnlinkWorktreeError {
-    #[error("Failed to remove .git gitlink file")]
-    RemoveGitLink(#[source] PathError),
-    #[error(transparent)]
-    Subprocess(#[from] GitSubprocessError),
+    #[error("Failed to unlink Git worktree")]
+    Git(#[from] gix::Error),
     #[error(transparent)]
     UnexpectedBackend(#[from] UnexpectedGitBackendError),
 }
 
-/// Disconnects the Git worktree at `worktree_path` from the repository.
+/// Disconnects the linked Git worktree at `worktree_path` from the repository.
 ///
-/// Returns `false` if there was no Git worktree to disconnect.
+/// Returns `false` if there was no linked Git worktree to disconnect.
 ///
 /// The worktree directory and its contents are left in place: only the `.git`
-/// gitlink and Git's bookkeeping under `.git/worktrees/` are removed. This is
-/// the inverse of [`create_worktree()`], which likewise only sets those up.
+/// gitlink and the selected worktree's bookkeeping under `.git/worktrees/` are
+/// removed. Other worktree registrations are retained even if their checkout
+/// directories are missing. This is the inverse of [`create_worktree()`].
 ///
-/// The gitlink is removed before the bookkeeping is pruned, so an error means
-/// either that nothing was done, or that the worktree is already disconnected
-/// and only stale metadata remains. Neither is worth failing a command over,
-/// so callers may treat all errors as non-fatal.
+/// The gitlink is removed before the bookkeeping, so an error means either
+/// that nothing was done, or that the worktree is already disconnected and
+/// only stale metadata remains. Callers may treat these errors as non-fatal.
 pub fn unlink_worktree(
     store: &Store,
-    subprocess_options: GitSubprocessOptions,
     worktree_path: &Path,
 ) -> Result<bool, GitUnlinkWorktreeError> {
-    let dot_git = worktree_path.join(".git");
-    if !dot_git.is_file() {
-        return Ok(false);
-    }
-    let git_backend = get_git_backend(store)?;
-    // `git worktree remove` isn't used because it deletes the directory
-    // contents, and forgetting a workspace should preserve its files.
-    std::fs::remove_file(&dot_git)
-        .context(&dot_git)
-        .map_err(GitUnlinkWorktreeError::RemoveGitLink)?;
-    // TODO: `git worktree prune` removes metadata for all worktrees whose
-    // working directories are missing, not just the one we removed. Ideally
-    // we'd target only the specific worktree.
-    let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
-    git_ctx.spawn_worktree_prune()?;
+    let git_repo = get_git_repo(store)?;
+    let target = match git_repo.prepare_remove_worktree(worktree_path) {
+        Ok(target) => target,
+        Err(err)
+            if matches!(
+                err.downcast_any_ref::<gix::worktree::remove::Error>(),
+                Some(
+                    gix::worktree::remove::Error::NotFound { .. }
+                        | gix::worktree::remove::Error::MainWorktree { .. }
+                )
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    target.unlink(gix::worktree::remove::Force::Never)?;
     Ok(true)
 }
 
@@ -2110,43 +1965,12 @@ pub async fn reset_head(
     // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
     // up.
     if git_repo.state().is_some() {
-        clear_operation_state(&git_repo)?;
+        git_repo
+            .clear_operation_state()
+            .map_err(GitResetHeadError::from_git)?;
     }
 
     reset_index(mut_repo, &git_repo, wc_commit).await
-}
-
-// TODO: Polish and upstream this to `gix`.
-fn clear_operation_state(git_repo: &gix::Repository) -> Result<(), GitResetHeadError> {
-    // Based on the files `git2::Repository::cleanup_state` deletes; when
-    // upstreaming this logic should probably become more elaborate to match
-    // `git(1)` behavior.
-    const STATE_FILE_NAMES: &[&str] = &[
-        "MERGE_HEAD",
-        "MERGE_MODE",
-        "MERGE_MSG",
-        "REVERT_HEAD",
-        "CHERRY_PICK_HEAD",
-        "BISECT_LOG",
-    ];
-    const STATE_DIR_NAMES: &[&str] = &["rebase-merge", "rebase-apply", "sequencer"];
-    let handle_err = |err: PathError| match err.source.kind() {
-        std::io::ErrorKind::NotFound => Ok(()),
-        _ => Err(GitResetHeadError::from_git(err)),
-    };
-    for file_name in STATE_FILE_NAMES {
-        let path = git_repo.path().join(file_name);
-        std::fs::remove_file(&path)
-            .context(&path)
-            .or_else(handle_err)?;
-    }
-    for dir_name in STATE_DIR_NAMES {
-        let path = git_repo.path().join(dir_name);
-        std::fs::remove_dir_all(&path)
-            .context(&path)
-            .or_else(handle_err)?;
-    }
-    Ok(())
 }
 
 async fn reset_index(
@@ -2417,17 +2241,6 @@ async fn update_intent_to_add_impl(
 
     index.sort_entries();
 
-    // The entry mutations above (`dangerously_push_entry`, `remove_entries`,
-    // `sort_entries`) do not invalidate the cache-tree (TREE) extension loaded
-    // from disk, and `gix::index::File::write()` re-emits it as-is. Its own
-    // docs prescribe this discard: "Until the tree-cache is updated on write
-    // (see gitoxide#2421), remove it with `State::remove_tree()` before writing
-    // whenever entries were changed." Otherwise the written index carries a
-    // stale, under-counted cache-tree; an external `git add` that later
-    // rebuilds it trusts those child counts and emits a doubled subtree entry,
-    // which `git fsck` reports as duplicateEntries.
-    index.remove_tree();
-
     Ok(())
 }
 
@@ -2512,13 +2325,6 @@ fn save_remote(
     remote_name: &RemoteName,
     remote: &mut gix::Remote,
 ) -> Result<(), GitRemoteManagementError> {
-    // Work around the gitoxide remote management bug
-    // <https://github.com/GitoxideLabs/gitoxide/issues/1951> by adding
-    // an empty section.
-    //
-    // Note that this will produce useless empty sections if we ever
-    // support remote configuration keys other than `fetch` and `url`.
-    config.new_section("remote", remote_name.as_str())?;
     remote.save_as_to(remote_name.as_str(), config)?;
     Ok(())
 }
@@ -2968,10 +2774,8 @@ pub enum GitFetchError {
     RefExpansion(#[from] GitRefExpansionError),
     #[error("Failed to update refs: {}", .0.iter().map(|n| n.as_symbol()).join(", "))]
     RejectedUpdates(Vec<GitRefNameBuf>),
-    #[error("Failed to prune stale refs")]
-    FailedToPrune(#[source] gix::Error),
-    #[error(transparent)]
-    Subprocess(#[from] GitSubprocessError),
+    #[error("Git fetch failed")]
+    Git(#[from] gix::Error),
 }
 
 #[derive(Error, Debug)]
@@ -3297,11 +3101,11 @@ fn parse_fetch_refspec(
     }
 }
 
-/// Helper struct to execute multiple `git fetch` operations
+/// Helper struct to fetch repeatedly from Git remotes.
 pub struct GitFetch<'a> {
     mut_repo: &'a mut MutableRepo,
     git_repo: Box<gix::Repository>,
-    git_ctx: GitSubprocessContext,
+    remote_options: GitRemoteOptions,
     import_options: &'a GitImportOptions,
     fetched: Vec<FetchedRefs>,
 }
@@ -3309,23 +3113,21 @@ pub struct GitFetch<'a> {
 impl<'a> GitFetch<'a> {
     pub fn new(
         mut_repo: &'a mut MutableRepo,
-        subprocess_options: GitSubprocessOptions,
+        remote_options: GitRemoteOptions,
         import_options: &'a GitImportOptions,
     ) -> Result<Self, UnexpectedGitBackendError> {
         let git_backend = get_git_backend(mut_repo.store())?;
         let git_repo = Box::new(git_backend.git_repo());
-        let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
         Ok(GitFetch {
             mut_repo,
             git_repo,
-            git_ctx,
+            remote_options,
             import_options,
             fetched: vec![],
         })
     }
 
-    /// Perform a `git fetch` on the local git repo, updating the
-    /// remote-tracking branches in the git repo.
+    /// Fetch into the backing Git repository, updating its remote-tracking refs.
     ///
     /// Keeps track of the {branch_names, remote_name} pair the refs can be
     /// subsequently imported into the `jj` repo by calling `import_refs()`.
@@ -3334,61 +3136,74 @@ impl<'a> GitFetch<'a> {
         &mut self,
         remote_name: &RemoteName,
         expr: &GitFetchRefExpression,
-        callback: &mut dyn GitSubprocessCallback,
+        callback: &mut dyn GitRemoteCallback,
         depth: Option<NonZeroU32>,
     ) -> Result<(), GitFetchError> {
         validate_remote_name(remote_name)?;
 
-        // check the remote exists
-        if try_find_active_remote_inner(&self.git_repo, remote_name).is_none() {
-            return Err(GitFetchError::NoSuchRemote(remote_name.to_owned()));
-        }
-
-        let (mut remaining_refspecs, negative_refspecs) = expand_fetch_refspecs(remote_name, expr)?;
-        if remaining_refspecs.is_empty() {
-            // Don't fall back to the base refspecs.
+        try_find_active_remote_inner(&self.git_repo, remote_name)
+            .ok_or_else(|| GitFetchError::NoSuchRemote(remote_name.to_owned()))??;
+        let (positive, negative) = expand_fetch_refspecs(remote_name, expr)?;
+        if positive.is_empty() {
             return Ok(());
         }
-
-        // git unfortunately errors out if one of the many refspecs is not found
-        //
-        // our approach is to filter out failures and retry,
-        // until either all have failed or an attempt has succeeded
-        //
-        // even more unfortunately, git errors out one refspec at a time,
-        // meaning that the below cycle runs in O(#failed refspecs)
-        let updates = loop {
-            let status = self.git_ctx.spawn_fetch(
-                remote_name,
-                &remaining_refspecs,
-                &negative_refspecs,
-                callback,
-                depth,
-            )?;
-            let failing_refspec = match status {
-                GitFetchStatus::Updates(updates) => break updates,
-                GitFetchStatus::NoRemoteRef(failing_refspec) => failing_refspec,
-            };
-            tracing::debug!(failing_refspec, "failed to fetch ref");
-            for refspec in
-                remaining_refspecs.extract_if(.., |r| r.source.as_ref() == Some(&failing_refspec))
-            {
-                // Even with --prune, an explicit ref won't be deleted during fetch.
-                if let Some(git_ref) = self
-                    .git_repo
-                    .try_find_reference(&refspec.destination)
-                    .map_err(GitFetchError::FailedToPrune)?
-                {
-                    git_ref.delete().map_err(GitFetchError::FailedToPrune)?;
-                }
-            }
+        let refspecs = positive
+            .iter()
+            .map(RefSpec::to_git_format)
+            .chain(negative.iter().map(NegativeRefSpec::to_git_format))
+            .collect_vec();
+        let repository = self.git_repo.as_ref().clone().into_sync();
+        let environment = self.remote_options.environment.clone();
+        let outcome = crate::git_remote::run_with_progress(
+            callback,
+            move |progress, sideband, interrupt| {
+                let repository = repository.to_thread_local();
+                let mut remote = repository
+                    .find_remote(remote_name.as_str())?
+                    .with_fetch_tags(gix::remote::fetch::Tags::None)
+                    .with_command_environment(environment);
+                remote.replace_refspecs(
+                    refspecs.iter().map(String::as_str),
+                    gix::remote::Direction::Fetch,
+                )?;
+                remote.fetch_with_remote_progress(
+                    gix::remote::fetch::Options {
+                        prune: true,
+                        missing_refs_allowed: true,
+                        shallow: depth
+                            .map(gix::remote::fetch::Shallow::DepthAtRemote)
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    progress,
+                    |is_error, bytes| sideband.send(is_error, bytes),
+                    interrupt,
+                )
+            },
+        )?;
+        let updates = match outcome.status {
+            gix::remote::fetch::Status::Change { update_refs, .. }
+            | gix::remote::fetch::Status::NoPackReceived { update_refs, .. } => update_refs,
         };
-
-        // Since remote refs are "force" updated, there should usually be no
-        // rejected refs. One exception is implicit tag updates.
-        if !updates.rejected.is_empty() {
-            let names = updates.rejected.into_iter().map(|(name, _)| name).collect();
-            return Err(GitFetchError::RejectedUpdates(names));
+        let rejected = updates
+            .updates
+            .iter()
+            .zip(&outcome.ref_map.mappings)
+            .filter(|(update, _)| {
+                matches!(
+                    update.mode,
+                    gix::remote::fetch::refs::update::Mode::RejectedSourceObjectNotFound { .. }
+                        | gix::remote::fetch::refs::update::Mode::RejectedTagUpdate
+                        | gix::remote::fetch::refs::update::Mode::RejectedNonFastForward
+                        | gix::remote::fetch::refs::update::Mode::RejectedToReplaceWithUnborn
+                        | gix::remote::fetch::refs::update::Mode::RejectedCurrentlyCheckedOut { .. }
+                )
+            })
+            .filter_map(|(_, mapping)| mapping.local.as_ref())
+            .map(|name| GitRefNameBuf::from(String::from_utf8_lossy(name).into_owned()))
+            .collect_vec();
+        if !rejected.is_empty() {
+            return Err(GitFetchError::RejectedUpdates(rejected));
         }
 
         self.fetched.push(FetchedRefs {
@@ -3405,10 +3220,21 @@ impl<'a> GitFetch<'a> {
         &self,
         remote_name: &RemoteName,
     ) -> Result<Option<RefNameBuf>, GitFetchError> {
-        if try_find_active_remote_inner(&self.git_repo, remote_name).is_none() {
-            return Err(GitFetchError::NoSuchRemote(remote_name.to_owned()));
-        }
-        let default_branch = self.git_ctx.spawn_remote_show(remote_name)?;
+        let mut remote = try_find_active_remote_inner(&self.git_repo, remote_name)
+            .ok_or_else(|| GitFetchError::NoSuchRemote(remote_name.to_owned()))??
+            .with_fetch_tags(gix::remote::fetch::Tags::None)
+            .with_command_environment(self.remote_options.environment.clone());
+        remote.replace_refspecs(
+            ["HEAD", "refs/heads/*:refs/heads/*"],
+            gix::remote::Direction::Fetch,
+        )?;
+        let (map, _) = remote.ref_map(gix::progress::Discard, Default::default())?;
+        let mut candidates = map.remote_head_candidates();
+        let candidate = candidates.next().filter(|_| candidates.next().is_none());
+        let default_branch = candidate
+            .and_then(|reference| reference.unpack().0.strip_prefix(b"refs/heads/"))
+            .map(|name| std::str::from_utf8(name).or_error().map(RefNameBuf::from))
+            .transpose()?;
         tracing::debug!(?default_branch);
         Ok(default_branch)
     }
@@ -3452,8 +3278,8 @@ pub enum GitPushError {
     NoSuchRemote(RemoteNameBuf),
     #[error(transparent)]
     RemoteName(#[from] GitRemoteNameError),
-    #[error(transparent)]
-    Subprocess(#[from] GitSubprocessError),
+    #[error("Git push failed")]
+    Git(#[from] gix::Error),
     #[error(transparent)]
     UnexpectedBackend(#[from] UnexpectedGitBackendError),
 }
@@ -3485,10 +3311,10 @@ pub struct GitPushOptions {
 /// Pushes the specified refs and updates the repo view accordingly.
 pub fn push_refs(
     mut_repo: &mut MutableRepo,
-    subprocess_options: GitSubprocessOptions,
+    remote_options: GitRemoteOptions,
     remote: &RemoteName,
     targets: &GitPushRefTargets,
-    callback: &mut dyn GitSubprocessCallback,
+    callback: &mut dyn GitRemoteCallback,
     options: &GitPushOptions,
 ) -> Result<GitPushStats, GitPushError> {
     validate_remote_name(remote)?;
@@ -3525,7 +3351,7 @@ pub fn push_refs(
 
     let push_stats = push_updates(
         mut_repo,
-        subprocess_options,
+        remote_options,
         remote,
         &ref_updates,
         callback,
@@ -3585,54 +3411,108 @@ pub fn push_refs(
 /// Pushes the specified Git refs without updating the repo view.
 pub fn push_updates(
     repo: &dyn Repo,
-    subprocess_options: GitSubprocessOptions,
+    remote_options: GitRemoteOptions,
     remote_name: &RemoteName,
     updates: &[GitRefUpdate],
-    callback: &mut dyn GitSubprocessCallback,
+    callback: &mut dyn GitRemoteCallback,
     options: &GitPushOptions,
 ) -> Result<GitPushStats, GitPushError> {
-    let mut qualified_remote_refs_expected_locations = HashMap::new();
-    let mut refspecs = vec![];
-    for update in updates {
-        qualified_remote_refs_expected_locations.insert(
-            update.qualified_name.as_ref(),
-            update.targets.before.as_deref(),
-        );
-        if let Some(new_target) = &update.targets.after {
-            // We always force-push. We use the push_negotiation callback in
-            // `push_refs` to check that the refs did not unexpectedly move on
-            // the remote.
-            refspecs.push(RefSpec::forced(
-                new_target.to_string(),
-                &update.qualified_name,
-            ));
-        } else {
-            // Prefixing this with `+` to force-push or not should make no
-            // difference. The push negotiation happens regardless, and wouldn't
-            // allow creating a branch if it's not a fast-forward.
-            refspecs.push(RefSpec::delete(&update.qualified_name));
-        }
-    }
+    use gix::push::Rejection;
+    use gix::push::Status;
 
-    let git_backend = get_git_backend(repo.store())?;
-    let git_repo = git_backend.git_repo();
-    let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
-
-    // check the remote exists
-    if try_find_active_remote_inner(&git_repo, remote_name).is_none() {
-        return Err(GitPushError::NoSuchRemote(remote_name.to_owned()));
-    }
-
-    let refs_to_push: Vec<RefToPush> = refspecs
+    let git_repo = get_git_repo(repo.store())?;
+    try_find_active_remote_inner(&git_repo, remote_name)
+        .ok_or_else(|| GitPushError::NoSuchRemote(remote_name.to_owned()))??;
+    let git_repo = git_repo.into_sync();
+    let remote_name = remote_name.to_owned();
+    let updates = updates
         .iter()
-        .map(|full_refspec| RefToPush::new(full_refspec, &qualified_remote_refs_expected_locations))
-        .collect();
+        .map(|update| {
+            Ok(gix::push::Update {
+                destination: gix::refs::FullName::try_from(update.qualified_name.as_str())
+                    .or_error()?,
+                new_id: update.targets.after,
+                lease: gix::push::Lease::MustMatch(update.targets.before),
+                force: false,
+            })
+        })
+        .collect::<gix::Result<Vec<_>>>()?;
+    let push_options = options
+        .remote_push_options
+        .iter()
+        .map(|option| BString::from(option.as_str()))
+        .collect_vec();
+    let outcomes = crate::git_remote::run_with_progress(
+        callback,
+        move |mut progress, sideband, interrupt| {
+            use gix::progress::NestedProgress as _;
 
-    let mut push_stats = git_ctx.spawn_push(remote_name, &refs_to_push, callback, options)?;
-    push_stats.pushed.sort();
-    push_stats.rejected.sort();
-    push_stats.remote_rejected.sort();
-    Ok(push_stats)
+            let git_repo = git_repo.to_thread_local();
+            let remote = git_repo
+                .find_remote(remote_name.as_str())?
+                .with_command_environment(remote_options.environment);
+            let urls = remote
+                .urls(gix::remote::Direction::Push)
+                .cloned()
+                .collect_vec();
+            let mut outcomes = Vec::with_capacity(urls.len());
+            for url in urls {
+                let remote = remote.clone().with_push_url_without_url_rewrite(url)?;
+                outcomes.push(remote.push(
+                    updates.clone(),
+                    gix::push::Options {
+                        push_options: &push_options,
+                        ..Default::default()
+                    },
+                    progress.add_child("push"),
+                    |is_error, bytes| sideband.send(is_error, bytes),
+                    interrupt,
+                )?);
+            }
+            Ok(outcomes)
+        },
+    )?;
+    let mut stats = GitPushStats::default();
+    for update in outcomes.into_iter().flat_map(|outcome| outcome.updates) {
+        let name = GitRefNameBuf::from(
+            String::from_utf8(update.update.destination.as_bstr().to_vec()).or_error()?,
+        );
+        let reason = match update.status {
+            Status::UpToDate | Status::Updated { .. } | Status::WouldUpdate { .. } => {
+                stats.pushed.push(name);
+                continue;
+            }
+            Status::Rejected(Rejection::Server(reason)) => {
+                stats
+                    .remote_rejected
+                    .push((name, Some(String::from_utf8_lossy(&reason).into_owned())));
+                continue;
+            }
+            Status::Rejected(Rejection::StaleLease) => "stale info",
+            Status::Rejected(Rejection::AlreadyExists) => "already exists",
+            Status::Rejected(Rejection::FetchFirst) => "fetch first",
+            Status::Rejected(Rejection::NeedsForce) => "needs force",
+            Status::Rejected(Rejection::NonFastForward) => "non-fast-forward",
+            Status::Rejected(Rejection::NonCommitBranch) => "new tip is not a commit",
+            Status::Rejected(Rejection::Atomic) => "atomic push failed",
+        };
+        stats.rejected.push((name, Some(reason.to_owned())));
+    }
+    // A ref is fully pushed only when every configured push destination accepted it.
+    stats.pushed.retain(|name| {
+        !stats
+            .rejected
+            .iter()
+            .chain(&stats.remote_rejected)
+            .any(|(rejected, _)| rejected == name)
+    });
+    stats.pushed.sort();
+    stats.pushed.dedup();
+    stats.rejected.sort();
+    stats.rejected.dedup();
+    stats.remote_rejected.sort();
+    stats.remote_rejected.dedup();
+    Ok(stats)
 }
 
 /// Constructs `RefEdit` to update pushed ref in the fetch namespace.
