@@ -39,8 +39,10 @@ in
 
     cargoLock = {
       lockFile = ./Cargo.lock;
-      # Gitoxide is pinned to a Git revision by Cargo.lock.
-      allowBuiltinFetchGit = true;
+      # Fetch the pinned commit directly, even if the development branch is rebased.
+      outputHashes = {
+        "gix-0.90.0" = "sha256-RAfyz9ghU1PU/fzPS7jhVEO+2pwkxi1HxlgoqNWKR4M=";
+      };
     };
     nativeBuildInputs =
       [
